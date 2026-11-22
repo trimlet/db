@@ -1,0 +1,1445 @@
+package main
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"slices"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/trimlet/gui"
+)
+
+type screen int
+
+const (
+	screenConnections screen = iota // the start: list of saved connections
+	screenDatabases                 // the databases of the server, when the string names none
+	screenMenu                      // what to look at in the database
+	screenTables                    // the tables of the database
+	screenTable                     // the page of a table
+	screenCreate                    // the CREATE TABLE script
+	screenData                      // select all, one page at a time
+	screenForm                      // questions, one after the other
+	screenConfirm                   // a yes/no question
+	screenBusy                      // waiting for the database
+)
+
+// Timeouts: connecting and reading the catalog or a page. Exports have none: esc stops them.
+const (
+	connectTimeout = 30 * time.Second
+	queryTimeout   = 60 * time.Second
+)
+
+// model holds the state of Trimlet DB and reacts to keys.
+// It knows nothing about the window: copying, quitting and running in the user
+// interface are done through callbacks.
+type model struct {
+	store  *Store
+	screen screen
+
+	connCursor  int
+	dbCursor    int
+	menuCursor  int
+	tableCursor int
+	favOnly     bool   // the tables list shows only the favourites
+	number      string // digits typed to pick an entry of a long list
+
+	conn       *Connection
+	eng        engine // the kind of database of the connection opened
+	connString string
+	server     *sql.DB // connected with the string as it is
+	db         *sql.DB // the database in use: the server itself, or the one chosen
+	dbName     string
+	chosen     bool // the database was chosen from the list
+	info       string
+	dbs        []string
+	tables     []table
+	table      *tableInfo
+	viewer     gui.Viewer
+	page       int
+	rows       [][]any
+	gridTop    int           // first row shown of the page
+	gridCursor int           // selected row of the page
+	gridLeft   int           // first column shown
+	favCols    bool          // Select all shows only the favourite columns
+	marked     map[int][]any // rows marked in Select all, by number in the table (from 0)
+	gridCol    int           // selected column of Select all, among those shown
+	sortCol    int           // column (in the table) Select all is ordered by; -1 the primary key
+	sortDesc   bool          // ordered by sortCol descending
+	colCursor  int           // selected column of the table page
+	tableTop   int           // first line shown of the table page
+	tableLines []string
+	colFirst   int // line of the table page with the first column
+
+	form    *form
+	confirm string
+	yes     func()
+	after   screen
+
+	busy    string // what we are waiting for
+	back    screen // where esc goes while busy
+	cancel  context.CancelFunc
+	runID   int
+	started time.Time
+	done    func() string // progress of an export, shown while busy
+
+	where map[string]string // server and database of each connection, for the list
+
+	status gui.Line
+	cols   int
+	height int // rows of the window
+
+	copy   func(text string)
+	quit   func()
+	dialog *gui.Dialog // the window in the middle (asking before quitting), when open
+	// ui runs f in the user interface and redraws; it can be called from any goroutine.
+	ui        func(f func())
+	now       func() time.Time
+	downloads string
+}
+
+func newModel(s *Store) *model {
+	home, _ := os.UserHomeDir()
+	return &model{
+		store:     s,
+		cols:      gui.DefaultCols,
+		where:     map[string]string{},
+		copy:      func(string) {},
+		quit:      func() {},
+		ui:        func(f func()) { f() },
+		now:       time.Now,
+		downloads: filepath.Join(home, "Downloads"),
+	}
+}
+
+// ---- Keys ----
+
+func (m *model) Key(k string) {
+	if m.dialog != nil {
+		d := m.dialog
+		m.dialog = nil
+		if !d.Key(k) {
+			m.dialog = d
+		}
+		return
+	}
+	if m.screen != screenForm {
+		m.status = nil
+	}
+	if k != gui.KeyEnter && k != gui.KeyBackspace {
+		m.number = ""
+	}
+	switch m.screen {
+	case screenConnections:
+		switch k {
+		case gui.KeyUp, gui.KeyDown:
+			m.connCursor = move(m.connCursor, k, len(m.store.Connections))
+		case gui.KeyEnter:
+			m.openConnection(m.connCursor)
+		case gui.KeyEsc:
+			m.dialog = gui.QuitDialog("Trimlet DB", m.quit)
+		}
+
+	case screenDatabases:
+		switch k {
+		case gui.KeyUp, gui.KeyDown:
+			m.dbCursor = move(m.dbCursor, k, len(m.dbs))
+		case gui.KeyEnter:
+			m.number = ""
+			m.useDatabase(m.dbCursor)
+		case gui.KeyBackspace:
+			m.backspace(&m.dbCursor, len(m.dbs))
+		case gui.KeyEsc:
+			m.closeConnection()
+		}
+
+	case screenMenu:
+		switch k {
+		case gui.KeyUp, gui.KeyDown:
+			m.menuCursor = move(m.menuCursor, k, 1)
+		case gui.KeyEnter:
+			m.openMenu(m.menuCursor)
+		case gui.KeyEsc:
+			m.leaveDatabase()
+		}
+
+	case screenTables:
+		n := len(m.shownTables())
+		switch k {
+		case gui.KeyUp, gui.KeyDown:
+			m.tableCursor = move(m.tableCursor, k, n)
+		case gui.KeyPageUp, gui.KeyPageDown:
+			m.tableCursor = page(m.tableCursor, k == gui.KeyPageDown, m.listRoom(), n)
+		case gui.KeyEnter:
+			m.number = ""
+			m.openTable(m.tableCursor)
+		case gui.KeyBackspace:
+			m.backspace(&m.tableCursor, n)
+		case gui.KeyEsc:
+			m.screen = screenMenu
+		}
+
+	case screenTable:
+		n := len(m.table.Columns)
+		switch k {
+		case gui.KeyEsc:
+			m.screen = screenTables
+		case gui.KeyUp:
+			m.colCursor = max(m.colCursor-1, 0)
+		case gui.KeyDown:
+			m.colCursor = min(m.colCursor+1, max(n-1, 0))
+		case gui.KeyPageUp, gui.KeyPageDown:
+			m.columnPage(k == gui.KeyPageDown)
+		case gui.KeyHome:
+			m.colCursor = 0
+		case gui.KeyEnd:
+			m.colCursor = max(n-1, 0)
+		}
+
+	case screenCreate:
+		if k == gui.KeyEsc {
+			m.showTable()
+			return
+		}
+		m.viewer.Key(k, m.cols, m.viewRoom())
+
+	case screenData:
+		switch k {
+		case gui.KeyEsc:
+			m.showTable()
+		case gui.KeyUp:
+			m.gridMove(-1)
+		case gui.KeyDown:
+			m.gridMove(1)
+		case gui.KeyPageUp:
+			m.gridPage(false)
+		case gui.KeyPageDown:
+			m.gridPage(true)
+		case gui.KeyLeft:
+			m.gridCol = max(m.gridCol-1, 0)
+		case gui.KeyRight:
+			m.gridCol = min(m.gridCol+1, max(len(m.shownColumns())-1, 0))
+		case gui.KeyHome:
+			m.gridTop, m.gridCursor, m.gridLeft, m.gridCol = 0, 0, 0, 0
+		}
+
+	case screenForm:
+		m.form.key(k)
+
+	case screenConfirm:
+		m.screen = m.after // any key other than y is no
+
+	case screenBusy:
+		if k == gui.KeyEsc {
+			m.stop()
+			m.screen = m.back
+		}
+	}
+}
+
+func (m *model) Rune(r rune) {
+	if m.dialog != nil {
+		d := m.dialog
+		m.dialog = nil
+		if !d.Rune(r) {
+			m.dialog = d
+		}
+		return
+	}
+	if m.screen != screenForm {
+		m.status = nil
+	}
+	if r < '0' || r > '9' {
+		m.number = ""
+	}
+	switch m.screen {
+	case screenConnections:
+		switch {
+		case r == 'n':
+			m.newConnection()
+		case r == 'm' && len(m.store.Connections) > 0:
+			m.editConnection()
+		case r == 'd' && len(m.store.Connections) > 0:
+			m.deleteConnection()
+		case r == 'q':
+			m.dialog = gui.QuitDialog("Trimlet DB", m.quit)
+		case r >= '1' && r <= '9':
+			m.openConnection(int(r - '1'))
+		}
+
+	case screenDatabases:
+		if i, ok := m.pick(r, &m.dbCursor, len(m.dbs)); ok {
+			m.useDatabase(i)
+		}
+
+	case screenMenu:
+		if r == '1' {
+			m.openMenu(0)
+		}
+
+	case screenTables:
+		n := len(m.shownTables())
+		switch {
+		case r == 'n' || r == 'p':
+			m.tableCursor = page(m.tableCursor, r == 'n', m.listRoom(), n)
+		case r == 'f':
+			m.toggleFavOnly()
+		default:
+			if i, ok := m.pick(r, &m.tableCursor, n); ok {
+				m.openTable(i)
+			}
+		}
+
+	case screenTable:
+		switch r {
+		case '1':
+			m.showCreate()
+		case '2':
+			m.readRows(0, 0, 0, -1, false)
+		case '3':
+			m.toggleFavourite()
+		case 'n', 'p':
+			m.columnPage(r == 'n')
+		case 'f':
+			m.toggleFavColumn()
+		}
+
+	case screenCreate:
+		switch r {
+		case 'c':
+			m.copy(m.eng.createScript(m.table))
+			m.say("Copied")
+		case 's':
+			m.saveCreate()
+		}
+
+	case screenData:
+		switch r {
+		case 'n':
+			m.gridPage(true)
+		case 'p':
+			m.gridPage(false)
+		case ' ':
+			m.toggleMark()
+		case 'u':
+			m.marked = nil
+		case 'f':
+			if m.hasFavColumns(true) {
+				m.toggleFavCols()
+			}
+		case 'o':
+			m.toggleOrder()
+		case 'c':
+			m.copyRow(rowText, textRows)
+		case 'j':
+			m.copyRow(rowJSON, jsonRows)
+		case 'e':
+			m.exportForm(exportCSV)
+		case 'i':
+			m.exportForm(exportInsert)
+		case 'd':
+			m.exportForm(exportDropCreate)
+		}
+
+	case screenForm:
+		m.form.rune(r)
+
+	case screenConfirm:
+		m.screen = m.after
+		if r == 'y' || r == 'Y' {
+			m.yes()
+		}
+	}
+}
+
+func (m *model) Paste(text string) {
+	if m.screen == screenForm {
+		m.form.paste(text)
+	}
+}
+
+func (m *model) CanPaste() bool { return m.screen == screenForm }
+
+// move takes the cursor one step up or down in a list of n entries, going round.
+func move(cursor int, k string, n int) int {
+	if n == 0 {
+		return 0
+	}
+	if k == gui.KeyUp {
+		return (cursor - 1 + n) % n
+	}
+	return (cursor + 1) % n
+}
+
+// page moves the cursor of a list of n entries shown room at a time: down, to the last
+// entry of its page, or when it is already there to the last entry of the next page;
+// up, the same with the first entry and the previous page.
+func page(cursor int, down bool, room, n int) int {
+	first := cursor / room * room
+	if down {
+		last := min(first+room-1, n-1)
+		if cursor < last {
+			return last
+		}
+		return max(min(cursor+room, n-1), 0)
+	}
+	if cursor > first {
+		return first
+	}
+	return max(cursor-room, 0)
+}
+
+// pick handles a digit typed in a list of n entries. Up to 9 entries the digit opens
+// its entry at once (ok); in longer lists the digits typed so far move the cursor to
+// that number and enter opens it.
+func (m *model) pick(r rune, cursor *int, n int) (int, bool) {
+	if r < '0' || r > '9' {
+		return 0, false
+	}
+	if n <= 9 {
+		i := int(r - '1')
+		return i, i >= 0 && i < n
+	}
+	number := m.number + string(r)
+	var i int
+	fmt.Sscan(number, &i)
+	if i < 1 || i > n {
+		return 0, false // ignore a digit that leads nowhere
+	}
+	m.number, *cursor = number, i-1
+	return 0, false
+}
+
+// backspace takes back the last digit typed in a long list.
+func (m *model) backspace(cursor *int, n int) {
+	if m.number == "" {
+		return
+	}
+	m.number = m.number[:len(m.number)-1]
+	var i int
+	fmt.Sscan(m.number, &i)
+	if i >= 1 && i <= n {
+		*cursor = i - 1
+	}
+}
+
+// ---- Forms and messages ----
+
+// ask opens a form; when it ends (done or esc) the screen goes back to the current one,
+// unless done moved somewhere else.
+func (m *model) ask(title string, qs []question, done func([]string) string) {
+	back := m.screen
+	m.form = newForm(title, qs, func(a []string) string {
+		m.screen = back
+		msg := done(a)
+		if msg != "" {
+			m.screen = screenForm
+		}
+		return msg
+	}, func() { m.screen = back })
+	if !m.form.finished() {
+		m.screen = screenForm
+	}
+}
+
+func (m *model) askYes(question string, yes func()) {
+	m.confirm, m.yes, m.after, m.screen = question, yes, m.screen, screenConfirm
+}
+
+func (m *model) saveStore() bool {
+	if err := m.store.save(); err != nil {
+		m.fail("Could not save: " + err.Error())
+		return false
+	}
+	return true
+}
+
+func (m *model) say(msg string) { m.status = gui.Line{gui.Strong("✔ "+msg, gui.Amber)} }
+
+func (m *model) fail(msg string) { m.status = gui.Line{gui.Strong("✘ "+msg, gui.Red)} }
+
+func capitalize(s string) string {
+	if s == "" {
+		return s
+	}
+	return strings.ToUpper(s[:1]) + s[1:]
+}
+
+// ---- Waiting for the database ----
+
+// run does work in the background showing what it waits for; esc stops it and goes
+// back to the current screen. When work ends, its result is applied in the user
+// interface: on error the error is shown on the screen we came from.
+func (m *model) run(what string, timeout time.Duration, work func(ctx context.Context) (func(), error)) {
+	ctx, cancel := context.Background(), context.CancelFunc(func() {})
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+	} else {
+		ctx, cancel = context.WithCancel(ctx)
+	}
+	m.runID++
+	id := m.runID
+	m.cancel, m.busy, m.back, m.started, m.done = cancel, what, m.screen, m.now(), nil
+	m.screen = screenBusy
+
+	// Redraw now and then, so the seconds waited go on.
+	go func() {
+		t := time.NewTicker(250 * time.Millisecond)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				m.ui(func() {})
+			}
+		}
+	}()
+	go func() {
+		apply, err := work(ctx)
+		timedOut := errors.Is(ctx.Err(), context.DeadlineExceeded)
+		cancel()
+		m.ui(func() {
+			if id != m.runID || m.screen != screenBusy {
+				return // stopped with esc
+			}
+			m.screen = m.back
+			if err != nil {
+				if timedOut {
+					err = fmt.Errorf("no answer within %d seconds", int(timeout.Seconds()))
+				}
+				m.fail(capitalize(err.Error()))
+				return
+			}
+			apply()
+		})
+	}()
+}
+
+func (m *model) stop() {
+	m.runID++
+	if m.cancel != nil {
+		m.cancel()
+	}
+}
+
+// ---- Connections ----
+
+func (m *model) checkName(except *Connection) func(string, []string) string {
+	return func(v string, _ []string) string {
+		if c := m.store.find(v); c != nil && c != except {
+			return "There is already a connection named " + v
+		}
+		return ""
+	}
+}
+
+// kindLabel is the question of the database kind, with its answers by number.
+const kindLabel = "Database (1 SQL Server · 2 PostgreSQL)"
+
+func checkKind(v string, _ []string) string {
+	if len(v) != 1 || v < "1" || v > fmt.Sprint(len(kinds)) {
+		return "Type 1 or 2"
+	}
+	return ""
+}
+
+func kindNumber(kind string) string {
+	for i, k := range kinds {
+		if k == kind {
+			return fmt.Sprint(i + 1)
+		}
+	}
+	return "1"
+}
+
+func kindFrom(answer string) string { return kinds[answer[0]-'1'] }
+
+// checkConnString checks the string for the kind chosen in the answer at index kindAt.
+func checkConnString(kindAt int) func(string, []string) string {
+	return func(v string, a []string) string {
+		if v == "" {
+			return ""
+		}
+		if err := engineOf(kindFrom(a[kindAt])).check(v); err != nil {
+			return capitalize(err.Error())
+		}
+		return ""
+	}
+}
+
+// whereOf is the kind, server and database of a saved connection, read once from the keychain.
+func (m *model) whereOf(c *Connection) string {
+	if w, ok := m.where[c.Name]; ok {
+		return w
+	}
+	e := engineOf(c.Type)
+	w := e.name() + " · no connection string saved"
+	if s, err := getConnString(c.Name); err != nil {
+		w = "could not read the keychain"
+	} else if s != "" {
+		w = e.name() + " · " + e.where(s)
+	}
+	m.where[c.Name] = w
+	return w
+}
+
+func (m *model) sortConnections() {
+	sort.SliceStable(m.store.Connections, func(i, j int) bool {
+		return strings.ToLower(m.store.Connections[i].Name) < strings.ToLower(m.store.Connections[j].Name)
+	})
+}
+
+func (m *model) indexOf(c *Connection) int {
+	for i, x := range m.store.Connections {
+		if x == c {
+			return i
+		}
+	}
+	return 0
+}
+
+func (m *model) newConnection() {
+	qs := []question{
+		{label: "Name", check: m.checkName(nil)},
+		{label: kindLabel, value: "1", check: checkKind},
+		{label: "Connection string", secret: true, check: checkConnString(1)},
+	}
+	m.ask("New connection", qs, func(a []string) string {
+		m.testAndSave(nil, a[0], kindFrom(a[1]), a[2])
+		return ""
+	})
+}
+
+func (m *model) editConnection() {
+	c := m.store.Connections[m.connCursor]
+	qs := []question{
+		{label: "Name", value: c.Name, check: m.checkName(c)},
+		{label: kindLabel, value: kindNumber(engineKind(c)), check: checkKind},
+		{label: "Connection string (empty keeps the saved one)", secret: true, optional: true, check: checkConnString(1)},
+	}
+	m.ask("Edit "+c.Name, qs, func(a []string) string {
+		kind, s := kindFrom(a[1]), a[2]
+		if s == "" {
+			var err error
+			if s, err = getConnString(c.Name); err != nil {
+				return "Could not read the keychain: " + err.Error()
+			}
+			if kind == engineKind(c) {
+				if a[0] != c.Name {
+					m.saveConnection(c, a[0], kind, s)
+				}
+				return "" // the string did not change: no need to try it again
+			}
+		}
+		m.testAndSave(c, a[0], kind, s)
+		return ""
+	})
+}
+
+// engineKind is the kind of a connection: the ones saved before there was a choice are SQL Server.
+func engineKind(c *Connection) string {
+	if c.Type == "" {
+		return kindSQLServer
+	}
+	return c.Type
+}
+
+// testAndSave tries the connection string; if it works it saves it, otherwise it shows
+// why and asks whether to save it anyway.
+func (m *model) testAndSave(c *Connection, name, kind, connString string) {
+	e := engineOf(kind)
+	m.run("Testing the connection…", connectTimeout, func(ctx context.Context) (func(), error) {
+		db, err := e.open(connString, "")
+		var info, dbName string
+		if err == nil {
+			defer db.Close()
+			if info, err = e.serverInfo(ctx, db); err == nil {
+				dbName, err = e.currentDatabase(ctx, db)
+			}
+		}
+		if err != nil {
+			msg := "Could not connect: " + err.Error()
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				msg = fmt.Sprintf("Could not connect: no answer within %d seconds", int(connectTimeout.Seconds()))
+			}
+			return func() {
+				m.askYes(msg+" · Save it anyway?", func() { m.saveConnection(c, name, kind, connString) })
+			}, nil
+		}
+		return func() {
+			if m.saveConnection(c, name, kind, connString) {
+				m.say("Saved " + name + " · " + info + " · database " + dbName)
+			}
+		}, nil
+	})
+}
+
+// saveConnection saves a new connection (c nil) or changes c: name, kind and string.
+func (m *model) saveConnection(c *Connection, name, kind, connString string) bool {
+	if c != nil && c.Name != name {
+		if err := deleteConnString(c.Name); err != nil {
+			m.fail("Could not change the keychain: " + err.Error())
+			return false
+		}
+	}
+	if err := setConnString(name, connString); err != nil {
+		m.fail("Could not save the connection string in the keychain: " + err.Error())
+		return false
+	}
+	if c == nil {
+		c = &Connection{}
+		m.store.Connections = append(m.store.Connections, c)
+	} else {
+		delete(m.where, c.Name)
+	}
+	c.Name, c.Type = name, kind
+	delete(m.where, name)
+	m.sortConnections()
+	m.connCursor = m.indexOf(c)
+	if !m.saveStore() {
+		return false
+	}
+	m.say("Saved " + name)
+	return true
+}
+
+func (m *model) deleteConnection() {
+	c := m.store.Connections[m.connCursor]
+	m.askYes("Delete the connection "+c.Name+" and its connection string?", func() {
+		if err := deleteConnString(c.Name); err != nil {
+			m.fail("Could not delete the connection string from the keychain: " + err.Error())
+			return
+		}
+		cs := m.store.Connections
+		i := m.indexOf(c)
+		m.store.Connections = append(cs[:i:i], cs[i+1:]...)
+		delete(m.where, c.Name)
+		m.connCursor = min(m.connCursor, max(len(m.store.Connections)-1, 0))
+		if m.saveStore() {
+			m.say("Deleted " + c.Name)
+		}
+	})
+}
+
+// ---- Opening a database ----
+
+func (m *model) openConnection(i int) {
+	if i < 0 || i >= len(m.store.Connections) {
+		return
+	}
+	m.connCursor = i
+	c := m.store.Connections[i]
+	e := engineOf(c.Type)
+	s, err := getConnString(c.Name)
+	if err != nil {
+		m.fail("Could not read the keychain: " + err.Error())
+		return
+	}
+	if s == "" {
+		m.fail("No connection string saved for " + c.Name + ": press m to set it")
+		return
+	}
+	choose := !e.namesDatabase(s)
+	m.run("Connecting to "+c.Name+"…", connectTimeout, func(ctx context.Context) (func(), error) {
+		db, err := e.open(s, "")
+		if err != nil {
+			return nil, err
+		}
+		info, err := e.serverInfo(ctx, db)
+		var dbName string
+		var dbs []string
+		if err == nil && choose {
+			dbs, err = e.databases(ctx, db)
+		} else if err == nil {
+			dbName, err = e.currentDatabase(ctx, db)
+		}
+		if err != nil {
+			db.Close()
+			return nil, err
+		}
+		return func() {
+			m.conn, m.eng, m.connString, m.server, m.info = c, e, s, db, info
+			if choose {
+				m.dbs, m.dbCursor, m.screen = dbs, 0, screenDatabases
+				return
+			}
+			m.db, m.dbName, m.chosen = db, dbName, false
+			m.menuCursor, m.screen = 0, screenMenu
+		}, nil
+	})
+}
+
+// useDatabase connects to database i of the server, with the same connection string.
+func (m *model) useDatabase(i int) {
+	if i < 0 || i >= len(m.dbs) {
+		return
+	}
+	m.dbCursor = i
+	name := m.dbs[i]
+	m.run("Opening "+name+"…", connectTimeout, func(ctx context.Context) (func(), error) {
+		db, err := m.eng.open(m.connString, name)
+		if err != nil {
+			return nil, err
+		}
+		if err := db.PingContext(ctx); err != nil {
+			db.Close()
+			return nil, err
+		}
+		return func() {
+			m.db, m.dbName, m.chosen = db, name, true
+			m.menuCursor, m.screen = 0, screenMenu
+		}, nil
+	})
+}
+
+// leaveDatabase goes back from the menu: to the list of databases or to the connections.
+func (m *model) leaveDatabase() {
+	m.tables, m.table = nil, nil
+	if m.chosen {
+		m.db.Close()
+		m.db, m.screen = nil, screenDatabases
+		return
+	}
+	m.closeConnection()
+}
+
+func (m *model) closeConnection() {
+	if m.db != nil && m.db != m.server {
+		m.db.Close()
+	}
+	if m.server != nil {
+		m.server.Close()
+	}
+	m.server, m.db, m.conn, m.eng, m.connString = nil, nil, nil, nil, ""
+	m.dbs, m.tables, m.table = nil, nil, nil
+	m.screen = screenConnections
+}
+
+// ---- Tables ----
+
+func (m *model) openMenu(i int) {
+	if i != 0 {
+		return
+	}
+	m.run("Reading the tables…", queryTimeout, func(ctx context.Context) (func(), error) {
+		list, err := m.eng.tables(ctx, m.db)
+		if err != nil {
+			return nil, err
+		}
+		return func() {
+			m.tables, m.tableCursor, m.favOnly, m.screen = list, 0, false, screenTables
+		}, nil
+	})
+}
+
+// openTable opens the i-th table of the list as shown.
+func (m *model) openTable(i int) {
+	shown := m.shownTables()
+	if i < 0 || i >= len(shown) {
+		return
+	}
+	m.tableCursor = i
+	i = shown[i]
+	t := m.tables[i]
+	m.run("Reading "+t.full()+"…", queryTimeout, func(ctx context.Context) (func(), error) {
+		info, err := m.eng.describe(ctx, m.db, t)
+		if err != nil {
+			return nil, err
+		}
+		return func() {
+			m.table = info
+			m.tables[i].Rows = info.Rows
+			m.colCursor, m.tableTop = 0, 0
+			m.showTable()
+		}, nil
+	})
+}
+
+// ---- Favourites ----
+
+// shownTables is the index in m.tables of each table of the list: all of them, or only
+// the favourites. It keeps the cursor inside the list.
+func (m *model) shownTables() []int {
+	var shown []int
+	for i, t := range m.tables {
+		if !m.favOnly || m.isFavourite(t.full()) {
+			shown = append(shown, i)
+		}
+	}
+	m.tableCursor = max(min(m.tableCursor, len(shown)-1), 0)
+	return shown
+}
+
+func (m *model) isFavourite(name string) bool {
+	return slices.Contains(m.conn.Favourites[m.dbName], name)
+}
+
+// toggleFavOnly switches the tables list between all the tables and the favourites,
+// keeping the cursor on the same table when it is still in the list.
+func (m *model) toggleFavOnly() {
+	var current string
+	if shown := m.shownTables(); len(shown) > 0 {
+		current = m.tables[shown[m.tableCursor]].full()
+	}
+	m.favOnly = !m.favOnly
+	m.tableCursor = 0
+	for i, j := range m.shownTables() {
+		if m.tables[j].full() == current {
+			m.tableCursor = i
+		}
+	}
+}
+
+// toggleFavourite adds the open table to the favourites of the database, or removes it.
+func (m *model) toggleFavourite() {
+	name := m.table.full()
+	favs := m.conn.Favourites[m.dbName]
+	if i := slices.Index(favs, name); i >= 0 {
+		favs = slices.Delete(favs, i, i+1)
+	} else {
+		favs = append(favs, name)
+	}
+	if m.conn.Favourites == nil {
+		m.conn.Favourites = map[string][]string{}
+	}
+	if len(favs) == 0 {
+		delete(m.conn.Favourites, m.dbName)
+	} else {
+		m.conn.Favourites[m.dbName] = favs
+	}
+	if m.saveStore() {
+		if m.isFavourite(name) {
+			m.say("Added to favourites")
+		} else {
+			m.say("Removed from favourites")
+		}
+	}
+}
+
+func (m *model) showTable() {
+	m.tableLines, m.colFirst = tablePage(m.table, m.isFavColumn)
+	m.screen = screenTable
+}
+
+// ---- Favourite columns ----
+
+// isFavColumn says whether a column of the open table is a favourite: the primary key
+// columns always are.
+func (m *model) isFavColumn(name string) bool {
+	return slices.Contains(m.table.primaryKey(), name) ||
+		slices.Contains(m.conn.FavColumns[m.dbName][m.table.full()], name)
+}
+
+// hasFavColumns says whether the open table has favourite columns, counting the primary
+// key ones only when withKey.
+func (m *model) hasFavColumns(withKey bool) bool {
+	return len(m.conn.FavColumns[m.dbName][m.table.full()]) > 0 || withKey && len(m.table.primaryKey()) > 0
+}
+
+// toggleFavColumn adds the selected column of the table page to the favourites, or
+// removes it; the primary key columns stay favourites.
+func (m *model) toggleFavColumn() {
+	if m.colCursor >= len(m.table.Columns) {
+		return
+	}
+	col := m.table.Columns[m.colCursor].Name
+	if slices.Contains(m.table.primaryKey(), col) {
+		return
+	}
+	name := m.table.full()
+	favs := m.conn.FavColumns[m.dbName][name]
+	if i := slices.Index(favs, col); i >= 0 {
+		favs = slices.Delete(favs, i, i+1)
+	} else {
+		favs = append(favs, col)
+	}
+	if m.conn.FavColumns == nil {
+		m.conn.FavColumns = map[string]map[string][]string{}
+	}
+	if m.conn.FavColumns[m.dbName] == nil {
+		m.conn.FavColumns[m.dbName] = map[string][]string{}
+	}
+	if len(favs) == 0 {
+		delete(m.conn.FavColumns[m.dbName], name)
+		if len(m.conn.FavColumns[m.dbName]) == 0 {
+			delete(m.conn.FavColumns, m.dbName)
+		}
+	} else {
+		m.conn.FavColumns[m.dbName][name] = favs
+	}
+	if m.saveStore() {
+		if m.isFavColumn(col) {
+			m.say("Added to favourite columns")
+		} else {
+			m.say("Removed from favourite columns")
+		}
+	}
+	m.tableLines, m.colFirst = tablePage(m.table, m.isFavColumn)
+}
+
+// shownColumns is the index of each column Select all shows: all, or the favourites.
+func (m *model) shownColumns() []int {
+	var shown []int
+	for i, c := range m.table.Columns {
+		if !m.favCols || m.isFavColumn(c.Name) {
+			shown = append(shown, i)
+		}
+	}
+	return shown
+}
+
+// tableScroll keeps the selected column of the table page in view, with the lines above
+// the first column when it is selected and the indexes under the last one, and gives the
+// first column shown and the last.
+func (m *model) tableScroll() (first, last int) {
+	room := m.viewRoom()
+	n := len(m.table.Columns)
+	line := m.colFirst + m.colCursor
+	top := min(m.tableTop, line)
+	top = max(top, line-room+1)
+	switch {
+	case m.colCursor == 0:
+		top = 0
+	case m.colCursor == n-1:
+		top = max(top, min(len(m.tableLines)-room, line))
+	}
+	m.tableTop = max(min(top, len(m.tableLines)-room), 0)
+	first = max(m.tableTop-m.colFirst, 0)
+	last = min(m.tableTop+room-1-m.colFirst, n-1)
+	return first, last
+}
+
+// columnPage moves the selected column of the table page as page does in the lists: down,
+// to the last column shown, or when it is already there by a screen; up, the same with
+// the first column shown.
+func (m *model) columnPage(down bool) {
+	n := len(m.table.Columns)
+	if n == 0 {
+		return
+	}
+	first, last := m.tableScroll()
+	room := max(last-first+1, 1)
+	if down {
+		if m.colCursor < last {
+			m.colCursor = last
+		} else {
+			m.colCursor = min(m.colCursor+room, n-1)
+		}
+		return
+	}
+	if m.colCursor > first {
+		m.colCursor = first
+	} else {
+		m.colCursor = max(m.colCursor-room, 0)
+	}
+}
+
+func (m *model) showCreate() {
+	m.viewer.Set(strings.TrimRight(m.eng.createScript(m.table), "\n"), "", true)
+	m.screen = screenCreate
+}
+
+// saveForm asks where to save a file, proposing a name in the last folder used.
+func (m *model) saveForm(title, base, ext string, save func(path string) string) {
+	dir := m.store.SaveDir
+	if dir == "" {
+		dir = m.downloads
+	}
+	name := fileName(dir, base, ext, m.now())
+	m.ask(title, []question{{label: "File", value: displayPath(filepath.Join(dir, name))}}, func(a []string) string {
+		path := resolvePath(a[0])
+		if msg := save(path); msg != "" {
+			return msg
+		}
+		m.store.SaveDir = filepath.Dir(path)
+		m.saveStore()
+		return ""
+	})
+}
+
+func (m *model) saveCreate() {
+	t := m.table
+	m.saveForm(m.crumbs()+" › save", t.full()+"-create", ".sql", func(path string) string {
+		if err := saveFile(path, []byte(m.eng.createScript(t))); err != nil {
+			return capitalize(err.Error())
+		}
+		m.say("Saved " + displayPath(path))
+		return ""
+	})
+}
+
+// ---- Select all ----
+
+// toggleMark marks the selected row of Select all, or unmarks it, and goes to the next one.
+func (m *model) toggleMark() {
+	if m.gridCursor < 0 || m.gridCursor >= len(m.rows) {
+		return
+	}
+	n := m.page*pageSize + m.gridCursor
+	if _, ok := m.marked[n]; ok {
+		delete(m.marked, n)
+	} else {
+		if m.marked == nil {
+			m.marked = map[int][]any{}
+		}
+		m.marked[n] = m.rows[m.gridCursor]
+	}
+	m.gridMove(1)
+}
+
+// isMarked says whether the i-th row of the page is marked.
+func (m *model) isMarked(i int) bool {
+	_, ok := m.marked[m.page*pageSize+i]
+	return ok
+}
+
+// copyRow copies the marked rows of Select all in their order, or the selected row when
+// none is marked, with the columns shown; format writes each row, join puts them together.
+func (m *model) copyRow(format func(e engine, cols []column, row []any) string, join func(rows []string) string) {
+	var rows [][]any
+	if len(m.marked) > 0 {
+		keys := make([]int, 0, len(m.marked))
+		for n := range m.marked {
+			keys = append(keys, n)
+		}
+		slices.Sort(keys)
+		for _, n := range keys {
+			rows = append(rows, m.marked[n])
+		}
+	} else if m.gridCursor >= 0 && m.gridCursor < len(m.rows) {
+		rows = append(rows, m.rows[m.gridCursor])
+	} else {
+		return
+	}
+	shown := m.shownColumns()
+	cols := make([]column, len(shown))
+	for i, j := range shown {
+		cols[i] = m.table.Columns[j]
+	}
+	texts := make([]string, len(rows))
+	for k, r := range rows {
+		row := make([]any, len(shown))
+		for i, j := range shown {
+			row[i] = r[j]
+		}
+		texts[k] = format(m.eng, cols, row)
+	}
+	if len(texts) == 1 {
+		m.copy(texts[0])
+		m.say("Row copied")
+		return
+	}
+	m.copy(join(texts))
+	m.say(fmt.Sprintf("%d rows copied", len(texts)))
+}
+
+// textRows puts rows written by rowText one after the other, with a blank line between.
+func textRows(rows []string) string { return strings.Join(rows, "\n") }
+
+// jsonRows puts rows written by rowJSON in a JSON array.
+func jsonRows(rows []string) string {
+	var b strings.Builder
+	b.WriteString("[\n")
+	for i, r := range rows {
+		lines := strings.Split(strings.TrimSuffix(r, "\n"), "\n")
+		for j, l := range lines {
+			b.WriteString("  " + l)
+			if j == len(lines)-1 && i < len(rows)-1 {
+				b.WriteString(",")
+			}
+			b.WriteString("\n")
+		}
+	}
+	b.WriteString("]\n")
+	return b.String()
+}
+
+// rowText writes a row as one "name = value" line per column, with the names aligned.
+func rowText(e engine, cols []column, row []any) string {
+	width := 0
+	for _, c := range cols {
+		width = max(width, len([]rune(c.Name)))
+	}
+	var b strings.Builder
+	for i, c := range cols {
+		s, null := e.text(row[i], c.Base)
+		if null {
+			s = "NULL"
+		}
+		fmt.Fprintf(&b, "%-*s = %s\n", width, c.Name, s)
+	}
+	return b.String()
+}
+
+// rowJSON writes a row as a JSON object with the columns in their order: NULL as null,
+// booleans and numbers as they are, json columns as JSON, everything else as text.
+func rowJSON(e engine, cols []column, row []any) string {
+	var b strings.Builder
+	b.WriteString("{\n")
+	for i, c := range cols {
+		var val any
+		switch x := row[i].(type) {
+		case nil, bool, int64:
+			val = x
+		case float64:
+			if isFinite(x) {
+				val = x
+			}
+		}
+		if val == nil && row[i] != nil {
+			s, _ := e.text(row[i], c.Base)
+			val = s
+			if (c.Base == "json" || c.Base == "jsonb") && json.Valid([]byte(s)) {
+				val = json.RawMessage(s)
+			}
+		}
+		v, err := jsonText(val)
+		if err != nil {
+			v, _ = jsonText(fmt.Sprint(val))
+		}
+		name, _ := jsonText(c.Name)
+		fmt.Fprintf(&b, "  %s: %s", name, v)
+		if i < len(cols)-1 {
+			b.WriteString(",")
+		}
+		b.WriteString("\n")
+	}
+	b.WriteString("}\n")
+	return b.String()
+}
+
+// jsonText writes v as JSON, leaving <, > and & as they are.
+func jsonText(v any) (string, error) {
+	var b strings.Builder
+	enc := json.NewEncoder(&b)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return "", err
+	}
+	return strings.TrimSuffix(b.String(), "\n"), nil
+}
+
+// gridMove moves the selected row of Select all by n rows. Past the last row of the page
+// it reads the next page, before the first row the previous one.
+func (m *model) gridMove(n int) {
+	last := len(m.rows) - 1
+	switch {
+	case n > 0 && m.gridCursor == last && len(m.rows) == pageSize:
+		m.selectAll(m.page+1, 0, 0)
+	case n < 0 && m.gridCursor == 0 && m.page > 0:
+		m.selectAll(m.page-1, pageSize-1, pageSize-1)
+	default:
+		m.gridCursor = max(min(m.gridCursor+n, last), 0)
+	}
+}
+
+// gridPage moves the selected row of Select all as page does in the lists: down, to the
+// last row shown, or when it is already there to the last row of the next screen, reading
+// the next page past the end of this one; up, the same with the first row.
+func (m *model) gridPage(down bool) {
+	room := m.gridRoom()
+	last := len(m.rows) - 1
+	if down {
+		bottom := min(m.gridTop+room-1, last)
+		switch {
+		case m.gridCursor < bottom:
+			m.gridCursor = bottom
+		case bottom < last:
+			m.gridCursor = min(m.gridCursor+room, last)
+		case len(m.rows) == pageSize:
+			m.selectAll(m.page+1, room-1, 0)
+		}
+		return
+	}
+	switch {
+	case m.gridCursor > m.gridTop:
+		m.gridCursor = m.gridTop
+	case m.gridTop > 0:
+		m.gridCursor = max(m.gridCursor-room, 0)
+		m.gridTop = m.gridCursor
+	case m.page > 0:
+		top := max(pageSize-room, 0)
+		m.selectAll(m.page-1, top, top)
+	}
+}
+
+// selectAll reads a page of the table in the order in use and selects its row at cursor,
+// showing it from row top.
+func (m *model) selectAll(page, cursor, top int) {
+	m.readRows(page, cursor, top, m.sortCol, m.sortDesc)
+}
+
+// readRows reads a page of the table ordered by column sortCol (-1 the primary key),
+// descending when desc, and selects its row at cursor, showing it from row top. Opening
+// Select all it shows the favourite columns, when there are some, and selects the
+// primary key one.
+func (m *model) readRows(page, cursor, top, sortCol int, desc bool) {
+	t := m.table
+	order := ""
+	if sortCol >= 0 {
+		order = orderColumn(m.eng, t, sortCol, desc)
+	}
+	m.run(fmt.Sprintf("Reading page %d of %s…", page+1, t.full()), queryTimeout, func(ctx context.Context) (func(), error) {
+		rows, err := readPage(ctx, m.eng, m.db, t, page, order)
+		if err != nil {
+			return nil, err
+		}
+		return func() {
+			if page > 0 && len(rows) == 0 {
+				m.say("No more rows")
+				return
+			}
+			m.page, m.rows = page, rows
+			m.gridCursor = min(cursor, len(rows)-1)
+			m.gridTop = top
+			m.sortCol, m.sortDesc = sortCol, desc
+			if m.screen != screenData {
+				m.gridLeft = 0
+				m.favCols = m.hasFavColumns(false)
+				m.marked = nil
+				m.gridCol = m.keyColumn()
+			}
+			m.screen = screenData
+		}, nil
+	})
+}
+
+// pkColumn is the index in the table of the first primary key column, or -1.
+func (m *model) pkColumn() int {
+	pk := m.table.primaryKey()
+	if len(pk) == 0 {
+		return -1
+	}
+	return slices.IndexFunc(m.table.Columns, func(c column) bool { return c.Name == pk[0] })
+}
+
+// keyColumn is where the first primary key column is among the columns shown, or 0.
+func (m *model) keyColumn() int {
+	return max(slices.Index(m.shownColumns(), m.pkColumn()), 0)
+}
+
+// toggleFavCols switches Select all between all the columns and the favourites, keeping
+// the selected column when it is still shown.
+func (m *model) toggleFavCols() {
+	shown := m.shownColumns()
+	col := -1
+	if m.gridCol < len(shown) {
+		col = shown[m.gridCol]
+	}
+	m.favCols, m.gridLeft = !m.favCols, 0
+	if i := slices.Index(m.shownColumns(), col); i >= 0 {
+		m.gridCol = i
+	} else {
+		m.gridCol = m.keyColumn()
+	}
+}
+
+// toggleOrder orders Select all by the selected column: ascending, then descending, then
+// back to the primary key. It starts again from the first row and unmarks the rows.
+func (m *model) toggleOrder() {
+	shown := m.shownColumns()
+	if m.gridCol >= len(shown) {
+		return
+	}
+	col := shown[m.gridCol]
+	current := m.sortCol
+	if current < 0 {
+		current = m.pkColumn()
+	}
+	sortCol, desc := col, false
+	switch {
+	case col == current && !m.sortDesc:
+		desc = true
+	case col == current, col == m.pkColumn():
+		sortCol = -1
+	case cannotOrder(m.eng, m.table.Columns[col].Base):
+		m.fail("Can't order by a " + m.table.Columns[col].Type + " column")
+		return
+	}
+	m.marked = nil
+	m.readRows(0, 0, 0, sortCol, desc)
+}
+
+// sortArrow is the arrow of column j (in the table) in the header of Select all, or "".
+func (m *model) sortArrow(j int) string {
+	arrow := "▲"
+	if m.sortDesc {
+		arrow = "▼"
+	}
+	if m.sortCol < 0 || m.sortCol == m.pkColumn() {
+		if slices.Contains(m.table.primaryKey(), m.table.Columns[j].Name) {
+			return arrow
+		}
+		return ""
+	}
+	if j == m.sortCol {
+		return arrow
+	}
+	return ""
+}
+
+// exportForm asks the file and then writes all rows of the table in it.
+func (m *model) exportForm(kind int) {
+	t := m.table
+	base, ext := t.full(), ".csv"
+	switch kind {
+	case exportInsert:
+		base, ext = t.full()+"-insert", ".sql"
+	case exportDropCreate:
+		base, ext = t.full()+"-drop-create-insert", ".sql"
+	}
+	m.saveForm(m.crumbs()+" › export", base, ext, func(path string) string {
+		f, err := createFile(path)
+		if err != nil {
+			return capitalize(err.Error())
+		}
+		m.export(kind, f, path)
+		return ""
+	})
+}
+
+func (m *model) export(kind int, f *os.File, path string) {
+	t := m.table
+	var written int64
+	m.run("Exporting "+t.full()+" to "+displayPath(path)+"…", 0, func(ctx context.Context) (func(), error) {
+		n, err := exportRows(ctx, m.eng, m.db, t, kind, f, func(n int64) {
+			m.ui(func() { written = n })
+		})
+		if cerr := f.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
+			os.Remove(path) // never leave half a file
+			if errors.Is(ctx.Err(), context.Canceled) {
+				return func() {}, nil
+			}
+			return nil, err
+		}
+		return func() { m.say(fmt.Sprintf("Exported %s rows to %s", thousands(n), displayPath(path))) }, nil
+	})
+	// After run: the export goes on until the end, esc stops it and removes the file.
+	m.done = func() string { return thousands(written) + " rows written" }
+}
+
+func thousands(n int64) string {
+	s := fmt.Sprint(n)
+	if n < 0 {
+		return s
+	}
+	var out []byte
+	for i := range s {
+		if i > 0 && (len(s)-i)%3 == 0 {
+			out = append(out, ',')
+		}
+		out = append(out, s[i])
+	}
+	return string(out)
+}
