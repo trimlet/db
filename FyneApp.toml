@@ -3,4 +3,4 @@ Icon = "assets/icon.png"
 Name = "Trimlet DB"
 ID = "local.trimletdb"
 Version = "0.1.0"
-Build = 135
+Build = 137
